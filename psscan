@@ -1,4 +1,5 @@
 #!/usr/bin/perl -w
+# vim:set softtabstop=4 sw=2 ft=perl:
 #
 # Scan process table and note differences since previous run.
 # Start a new set of differences every day
@@ -12,44 +13,106 @@
 
 use strict;
 
-use constant  LOG_DIR => qq(/var/log/sa/ps) . "/";
 
 package psscan;
+use Exporter 'import';
+our @EXPORT=qw(snapshot);
 
 sub snapshot {
-	my $SKIP_KTHREADS = ( $ENV{SHOW_KTHREADS} ? 0 : 1 );
-	my $SKIP_INTERACTIVE = ( $ENV{SHOW_INTERACTIVE} ? 0 : 1 );
-	my $pgrp = getpgrp;
-	my $ps_cmd = 
-		'/bin/ps -A --sort tty,comm,pid -ww ' .
-		' -o pgrp:8,tty:7,pid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args '; 
+    my $pgrp = getpgrp;
+    my $ps_cmd = 
+	'/bin/ps -A --sort $PS_OUTPUT_OPTS -ww ' .
+	' -o pgrp:8,tty:7,pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args '; 
 
-	open(PS,"-|",$ps_cmd) || die "Cannot run ps command : $!";
-	$_ = <PS>;
-	if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
-	my $out = $_;
-	while (<PS>) {
-		my @f=split;
-		next if $f[0] eq $pgrp; 	# skip if in our process group
-		next if $SKIP_KTHREADS && $f[1] eq '?' && $f[5] == 0 && $f[7] == 0;
-		next if $SKIP_INTERACTIVE && $f[1] ne '?';
-		if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
-		$out .= $_;
-	}
+    open(PS,"-|",$ps_cmd) || die "Cannot run ps command : $!";
+    $_ = <PS>;
+    if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
+    my $out = $_;
+    while (<PS>) {
+	my @f=split;
+	next if $f[0] eq $pgrp; 	# skip if in our process group
+	next if $SKIP_KTHREADS && $f[1] eq '?' && $f[5] == 0 && $f[7] == 0;
+	next if $SKIP_INTERACTIVE && $f[1] ne '?';
+	substr($_, 1, $SKIP_INTERACTIVE ? 17 : 9)='';
+	$out .= $_;
+    }
 
-	close PS;
-	return $out;
+    close PS;
+    return $out;
 }
+
+package opts;
+use Getopts::Std;
+our %opts = (
+    'c' => "/etc/psscan",
+);
+getopts("kic:l:a:o:s:",\%opts);
+require $opts{'c'};
+pick {
+    my $caller = shift;
+    my $pkg = qw(opts);
+    my ($var,$opt,$default) = @_;
+    $$var = exists $opts{$opt}? $opts{$opt} : defined $$var ? $$var : $ENV{$var} ? $ENV{$var} : $default;
+    *{"$callpkg\::$var"} = \&{"$pkg\::$var"};
+}
+import {
+    my $c = caller;
+    pick($c,LOG_DIR,'l',"/var/log/sa/ps/");
+    pick($c,ARCHIVE_DIR,'a',"/var/log/sa/ps/"."/archive/");
+    pick($c,PS_OUTPUT_OPTS,'o',
+	q( pgrp:8,tty:7,pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args ));
+    pick($c,PS_SORT_OPTS,'s',
+	q( tty,comm,pid ));
+    pick($c,SHOW_KTHREADS,'k',0);
+    pick($c,SHOW_INTERACTIVE,'i',0);
+}
+	
 
 package main;
 use POSIX qw(strftime);
+use opts;
+use psscan;
 
-my $outfile=strftime(LOG_DIR . "ps%d",localtime);
-open (OUT,">> ",$outfile) || die "Cannot append to '$outfile': $!";
-flock(OUT,2);
+# Return true if last mtime on arg1 is older than one day
+sub should_rotate {
+    my ($file) = @_;
+    if (-f $file) { 
+	# Remove old file
+	my $outfile_mtime=(stat($file))[9];
+	if ($outfile_mtime < localtime - (24*60*60) ) {
+	    return 1;
+	}
+    }
+    0;
+}
+
+# Move the file in arg1 to an archive directory (arg2)
+sub rotate {
+    my ($file,$dir) = @_;
+    system("mkdir -p $dir");
+    if ($? == -1 || ($?>>8) != 0) { 
+	warn "mkdir of $dir exited with $?: $!";
+	return 0;
+    }
+    
+    system("/bin/mv $file $dir");
+    if ($? == -1 || ($?>>8) != 0) { 
+	warn "/bin/mv of $file to $dir exited with $?: $!";
+	return 0;
+    }
+    1;
+}
+
+my $daynum=strftime("%d",localtime);
+my $outfile= $::LOG_DIR . "ps" . $daynum;
+rotate($outfile,$::ARCHIVE_DIR) if should_rotate($outfile);
+
+open (OUT,">>",$outfile) || die "Cannot open-for-writing or append to '$outfile': $!";
 my $snapshot = &psscan::snapshot(@ARGV);
-print OUT "=== " . localtime() . " === (" . time . ") ===\n";
-print OUT $snapshot."\l\n";
+flock(OUT,2);
+print OUT "\n=== " . localtime() . " === (" . time . ") ===\n";
+print OUT $snapshot;
+print OUT "\l";
 close OUT;
 
 1;
