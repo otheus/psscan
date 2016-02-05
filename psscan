@@ -1,0 +1,55 @@
+#!/usr/bin/perl -w
+#
+# Scan process table and note differences since previous run.
+# Start a new set of differences every day
+#
+# Version: 1.0-1.el6
+# Build Date: 24/Oct/2013
+# 
+# 2009-03-29 *otheus*
+# 2009-07-01  minor changes for blog
+# 2013-10-24  converted to perl and dropped diffing
+
+use strict;
+
+use constant  LOG_DIR => qq(/var/log/sa/ps) . "/";
+
+package psscan;
+
+sub snapshot {
+	my $SKIP_KTHREADS = ( $ENV{SHOW_KTHREADS} ? 0 : 1 );
+	my $SKIP_INTERACTIVE = ( $ENV{SHOW_INTERACTIVE} ? 0 : 1 );
+	my $pgrp = getpgrp;
+	my $ps_cmd = 
+		'/bin/ps -A --sort tty,comm,pid -ww ' .
+		' -o pgrp:8,tty:7,pid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args '; 
+
+	open(PS,"-|",$ps_cmd) || die "Cannot run ps command : $!";
+	$_ = <PS>;
+	if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
+	my $out = $_;
+	while (<PS>) {
+		my @f=split;
+		next if $f[0] eq $pgrp; 	# skip if in our process group
+		next if $SKIP_KTHREADS && $f[1] eq '?' && $f[5] == 0 && $f[7] == 0;
+		next if $SKIP_INTERACTIVE && $f[1] ne '?';
+		if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
+		$out .= $_;
+	}
+
+	close PS;
+	return $out;
+}
+
+package main;
+use POSIX qw(strftime);
+
+my $outfile=strftime(LOG_DIR . "ps%d",localtime);
+open (OUT,">> ",$outfile) || die "Cannot append to '$outfile': $!";
+flock(OUT,2);
+my $snapshot = &psscan::snapshot(@ARGV);
+print OUT "=== " . localtime() . " === (" . time . ") ===\n";
+print OUT $snapshot."\l\n";
+close OUT;
+
+1;
