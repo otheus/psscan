@@ -1,4 +1,5 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl 
+# vim:set softtabstop=4 sw=2 ft=perl:
 #
 # Scan process table and note differences since previous run.
 # Start a new set of differences every day
@@ -10,46 +11,144 @@
 # 2009-07-01  minor changes for blog
 # 2013-10-24  converted to perl and dropped diffing
 
-use strict;
+#use strict;
+no strict 'refs';
 
-use constant  LOG_DIR => qq(/var/log/sa/ps) . "/";
 
 package psscan;
 
-sub snapshot {
-	my $SKIP_KTHREADS = ( $ENV{SHOW_KTHREADS} ? 0 : 1 );
-	my $SKIP_INTERACTIVE = ( $ENV{SHOW_INTERACTIVE} ? 0 : 1 );
-	my $pgrp = getpgrp;
-	my $ps_cmd = 
-		'/bin/ps -A --sort tty,comm,pid -ww ' .
-		' -o pgrp:8,tty:7,pid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args '; 
+local %F;
+local $memsz_idx;;
+local $comm_idx; 
 
-	open(PS,"-|",$ps_cmd) || die "Cannot run ps command : $!";
-	$_ = <PS>;
-	if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
-	my $out = $_;
-	while (<PS>) {
-		my @f=split;
-		next if $f[0] eq $pgrp; 	# skip if in our process group
-		next if $SKIP_KTHREADS && $f[1] eq '?' && $f[5] == 0 && $f[7] == 0;
-		next if $SKIP_INTERACTIVE && $f[1] ne '?';
-		if ($SKIP_INTERACTIVE) { s/^.{17}//; } else { s/^.{9}//; }
-		$out .= $_;
-	}
-
-	close PS;
-	return $out;
+sub mapfields { 
+    my @f=split;
+    map { $f[$_] => $_ } 0..$#f;
 }
+
+sub snapshot {
+    my $pgrp = shift;
+    my $pscmd = shift;
+    my $truncate= ($opts::SHOW_INTERACTIVE ? 9 : 17);
+
+    open(PS,"-|",$pscmd) || die "Cannot run ps command : $!";
+    $_ = <PS>;
+    my $out = $_;
+    if (!%F) { 
+      %F=&mapfields($_);
+      $memsz_idx= $F{VSZ}||$F{RSS}||$F{SZ};
+      $comm_idx= $F{COMMAND}||$F{CMD};
+    }
+
+    while (<PS>) {
+	my @f=split;
+	next if $f[0] eq $pgrp; 	# skip if in our process group
+	next if !$opts::SHOW_INTERACTIVE && $f[1] ne '?';
+	next if !$opts::SHOW_KTHREADS && $f[1] eq '?' &&
+	    $f[$memsz_idx] == 0  &&
+	    $f[$comm_idx] =~ /^\[.*\]$/ ; # overkill?
+	substr($_, 0, $truncate)='';
+	$out .= $_;
+    }
+    close PS;
+    return $out;
+}
+
+package opts;
+use Getopt::Std;
+
+local %opts = (
+    'c' => "/etc/psscan",
+);
+
+sub pick {
+    my $caller = shift;
+    my $pkg = qw(opts);
+    my ($var,$opt,$default) = @_;
+    $$var = exists $opts{$opt}? $opts{$opt} : defined $$var ? $$var : $ENV{$var} ? $ENV{$var} : $default;
+    # *{"$callpkg\::$var"} = \&{"$pkg\::$var"};
+}
+
+sub init {
+    getopts("kic:l:a:o:s:",\%opts);
+    do $opts{'c'} if -r $opts{'c'};
+
+    my $c = caller;
+    my $debug= defined $DB::VERSION;
+    pick($c,'LOG_DIR','l',($debug?"/tmp/":"/var/log/sa/ps/"));
+    pick($c,'ARCHIVE_DIR','a',"/var/log/sa/ps/"."/archive/");
+    pick($c,'PS_EXEC','E',"/bin/ps");
+    pick($c,'PS_OUTPUT_OPTS','o',
+	qw( pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args ));
+    pick($c,'PS_SORT_OPTS','s',
+	qw( tty,comm,pid ));
+    pick($c,'SHOW_KTHREADS','K',0);
+    pick($c,'SHOW_INTERACTIVE','I',0);
+    pick($c,'INTERVAL','i',60);
+}
+	
 
 package main;
 use POSIX qw(strftime);
 
-my $outfile=strftime(LOG_DIR . "ps%d",localtime);
-open (OUT,">> ",$outfile) || die "Cannot append to '$outfile': $!";
+my @ARGV_ORIG = @ARGV;
+&opts::init;
+
+sub reboot {
+  exec( $^X, $0, @ARGV_ORIG ) or die "Can't re-exec myself($^X,$0): $!\n";
+}
+
+# Return true if last mtime on arg1 is older than one day
+sub should_rotate {
+    my ($file) = @_;
+    return (-f $file && (stat(_))[9] < time - (24*60*60) );
+}
+
+sub rotate {
+  system("logrotate -f $opts::PSSCAN_ROTATE_CONF");
+}
+
+sub max2 { ($_[0] > $_[1] ? $_[0] : $_[1] ) }
+sub min2 { ($_[0] > $_[1] ? $_[1] : $_[0] ) }
+
+sub calculate_count { 
+    use Date::Calc;
+    use Time::Local 'timelocal_nocheck';
+    my $interval = max2(shift,1);
+    my $time = shift;
+    my ($now,@now)=($time,localtime($time));
+    my $midnight=Time::Local::timelocal(0,0,0,reverse Date::Calc::Add_Delta_Days(@now[5,4,3],1));
+    my $secondsleft = $midnight-$now-1;
+    # Return the number of intervals we can perform until midnight. 
+    # If $secondsleft <= $interval, we should perfom exactly 1. 
+    # If $secondsleft > $interval, we should perform at least 1.
+    return int($secondsleft / $interval) + ($secondsleft % $interval ? 1 : 0);
+}
+
+my $outfile= $opts::LOG_DIR . "today";
+rotate($outfile) if should_rotate($outfile);
+
+my $count = calculate_count($opts::INTERVAL,time);
+my $pgrp = getpgrp;
+my $pscmd = $opts::PS_EXEC . ' -ww -A --sort ' . $opts::PS_SORT_OPTS .  
+	  ' -o pgrp:8,tty:7,' . $opts::PS_OUTPUT_OPTS;
+
+
+$SIG{'HUP'} = \&reboot;
+open (OUT,">>",$outfile) || die "Cannot open-for-writing or append to '$outfile': $!";
 flock(OUT,2);
-my $snapshot = &psscan::snapshot(@ARGV);
-print OUT "=== " . localtime() . " === (" . time . ") ===\n";
-print OUT $snapshot."\l\n";
+select(OUT);
+$|=1;
+while ( $count-- > 0 ) {
+  my $snapshot = &psscan::snapshot($pgrp,$pscmd);
+  print OUT "\n=== " . localtime() . " === (" . time . ") ===\n" . $snapshot . "\l";
+}
+continue {
+  sleep $opts::INTERVAL if $count;
+}
+
 close OUT;
+
+&reboot;
 
 1;
