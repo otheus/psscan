@@ -4,64 +4,33 @@
 # Scan process table and note differences since previous run.
 # Start a new set of differences every day
 #
-# Version: 1.0-1.el6
-# Build Date: 24/Oct/2013
+# Version: 2.0
+# Build Date: 2016-02-05
 # 
 # 2009-03-29 *otheus*
 # 2009-07-01  minor changes for blog
 # 2013-10-24  converted to perl and dropped diffing
+# 2016-02-05  overhaul: runs more like a daemon than cronjob
 
-#use strict;
-no strict 'refs';
+use strict;
 
-
-package psscan;
-
-local %F;
-local $memsz_idx;;
-local $comm_idx; 
-
-sub mapfields { 
-    my @f=split;
-    map { $f[$_] => $_ } 0..$#f;
-}
-
-sub snapshot {
-    my $pgrp = shift;
-    my $pscmd = shift;
-    my $truncate= ($opts::SHOW_INTERACTIVE ? 9 : 17);
-
-    open(PS,"-|",$pscmd) || die "Cannot run ps command : $!";
-    $_ = <PS>;
-    my $out = $_;
-    if (!%F) { 
-      %F=&mapfields($_);
-      $memsz_idx= $F{VSZ}||$F{RSS}||$F{SZ};
-      $comm_idx= $F{COMMAND}||$F{CMD};
-    }
-
-    while (<PS>) {
-	my @f=split;
-	next if $f[0] eq $pgrp; 	# skip if in our process group
-	next if !$opts::SHOW_INTERACTIVE && $f[1] ne '?';
-	next if !$opts::SHOW_KTHREADS && $f[1] eq '?' &&
-	    $f[$memsz_idx] == 0  &&
-	    $f[$comm_idx] =~ /^\[.*\]$/ ; # overkill?
-	substr($_, 0, $truncate)='';
-	$out .= $_;
-    }
-    close PS;
-    return $out;
-}
-
+#### OPTIONS  PARSER AND CONTAINER 
 package opts;
 use Getopt::Std;
 
-local %opts = (
-    'c' => "/etc/psscan",
+# For perl newb's: we're actually using the namespace opts to store
+# all the options. This allows options to be contained and yet quasi 
+# global. Options are set within the pick() sub by symbolic reference
+# and are accessed as $opts::VARNAME. Unorthodox but useful.
+# Among other things, it allows us to read in a configuration file
+# without worrying too much about overwriting local variables. 
+
+my %opts = (
+    'c' => "/etc/psscan.conf",
 );
 
 sub pick {
+    no strict 'refs';
     my $caller = shift;
     my $pkg = qw(opts);
     my ($var,$opt,$default) = @_;
@@ -70,42 +39,143 @@ sub pick {
 }
 
 sub init {
-    getopts("kic:l:a:o:s:",\%opts);
+    getopts("KIE:i:c:l:r:o:s:",\%opts);
+    no strict 'vars'; # we know what we're doing.
     do $opts{'c'} if -r $opts{'c'};
 
     my $c = caller;
     my $debug= defined $DB::VERSION;
-    pick($c,'LOG_DIR','l',($debug?"/tmp/":"/var/log/sa/ps/"));
-    pick($c,'ARCHIVE_DIR','a',"/var/log/sa/ps/"."/archive/");
-    pick($c,'PS_EXEC','E',"/bin/ps");
-    pick($c,'PS_OUTPUT_OPTS','o',
-	qw( pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args ));
-    pick($c,'PS_SORT_OPTS','s',
-	qw( tty,comm,pid ));
+    pick($c,'LOG_DIR','l',($debug?"/tmp/":"/var/log/ps/"));
+    $LOG_DIR =~ s/\/?$/\//; # terminate dir with /
+    # pick($c,'ROTATE_CONF','r',"/etc/psscan.rotate");
     pick($c,'SHOW_KTHREADS','K',0);
     pick($c,'SHOW_INTERACTIVE','I',0);
     pick($c,'INTERVAL','i',60);
+    die "Interval is too short. Set to 10 (s) or greater" 
+	unless $INTERVAL >= 10;
+    pick($c,'PS_EXEC','E',"/bin/ps");
+    die "PS_EXEC does not point to a valid executable" unless -x $PS_EXEC;
+    pick($c,'PS_OUTPUT_OPTS','o',
+	qw( pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args ));
+    die "To filter out KThreads, PS_OUTPUT_OPTS must include one of args/cmd/comm and one of rss/sz/vss/vsz/size"
+	if $SHOW_KTHREADS == 0 && 
+	   $PS_OUTPUT_OPTS !~ /\b(args|comm|cmd)\b/i &&
+	   $PS_OUTPUT_OPTS !~ /\b(rss|vss|sz|size)\b/i ;
+    pick($c,'PS_SORT_OPTS','s',
+	qw( tty,comm,pid ));
 }
 	
+package psscan;
+#### Where the cool stuff happens
 
+my $memsz_start;
+my $memsz_len;
+my $comm_start;
+my $comm_len;
+my $header;
+
+# Parse header and determine where memory info and command can be found
+sub determine_indexes {
+    local($_)=shift;
+    # Determine column positions from clues in the header.
+    if ( /\b\s+(VSZ|SZ|RSS|RSZ)\b/ ) {
+      # header is right-aligned; start with whitespace
+      $memsz_start = $-[0];
+      $memsz_len = $+[1] - $-[0];
+    }
+    if ( /\b\s*(COMMAND|COMM)(\s*)\b/ ) {
+      # header is left-aligned, maybe eol
+      $comm_start = $-[1];
+      # if eol / last field, set to -1 (removes newline)
+      $comm_len = ($+[2] gt $+[1] ? $+[2] - $-[1] : -1 );
+    }
+}
+# Return the process' memory-info field
+sub get_sz {
+    int(substr($_[0],$memsz_start,$memsz_len));
+}
+# Return the process' command/arguments field
+sub get_cmd {
+    substr($_[0],$comm_start,$comm_len);
+}
+sub is_interactive { 
+    $_[1] ne '?'; # has a tty
+}
+sub is_kthread { 
+    $_[1] eq '?' &&	# no tty
+    get_sz($_[0])==0 &&	# no memory allocated
+    get_cmd($_[0]) =~ /^\[.*\]$/;  # cmd looks like [this:1]
+}
+
+# run ps, filter output; save and return multi-lined string.
+sub snapshot {
+    my $pgrp = shift;
+    my $pscmd = shift;
+    my $truncate_prefix= ($opts::SHOW_INTERACTIVE ? 9 : 17);
+
+    open(PS,"-|",$pscmd) || die "Cannot run ps command : $!";
+    $_ = <PS>;
+    if (! defined $header) {
+      $header = $_;
+      &determine_indexes($_) if $opts::SHOW_KTHREADS == 0;
+    }
+    my $out = substr($_, $truncate_prefix);
+    while (<PS>) {
+	my @f=split;
+	next if $f[0] eq $pgrp; 	# skip if in our process group
+	next if !$opts::SHOW_INTERACTIVE && is_interactive($_,$f[1]);
+	next if !$opts::SHOW_KTHREADS && is_kthread($_,$f[1]);
+	s/\s+$/\n/s; # trim whitespace, retain newline
+	$out .= substr($_, $truncate_prefix);
+    }
+    close PS;
+    return $out;
+}
+
+
+### Main
 package main;
-use POSIX qw(strftime);
-
+use POSIX qw(:signal_h sigprocmask);
 my @ARGV_ORIG = @ARGV;
+# warn "$0 starting up";
 &opts::init;
 
 sub reboot {
+  # From http://docstore.mik.ua/orelly/perl4/cook/ch17_19.htm
+  warn "HUP received: Restarting $0";
+
+  # Cancel the sleep
+  alarm(0);
+
+  # make signals harmless
+  for my $nal (qw[ALARM CHLD HUP INT PIPE TERM]) { $SIG{$nal} = sub {}; }
+
+  # reenable them
+  my $s = POSIX::SigSet->new;
+  my $t = POSIX::SigSet->new;
+  sigprocmask(SIG_UNBLOCK, $s, $t);
+
   exec( $^X, $0, @ARGV_ORIG ) or die "Can't re-exec myself($^X,$0): $!\n";
 }
 
 # Return true if last mtime on arg1 is older than one day
 sub should_rotate {
     my ($file) = @_;
-    return (-f $file && (stat(_))[9] < time - (24*60*60) );
+    return (-f $file && -s _ && (stat(_))[9] < time - (24*60*60) );
 }
 
+### Poor man's rotate
+###  move "/var/log/ps/today" to "/var/log/ps/20160201"
 sub rotate {
-  system("logrotate -f $opts::PSSCAN_ROTATE_CONF");
+  use POSIX;
+  my $file = shift;
+  my $ft = (stat($file))[9];
+  my $yyyymmdd = POSIX::strftime("%Y%m%d",localtime($ft));
+  my $newfile = $file;
+  $newfile =~ s/\btoday$/$yyyymmdd/;
+  # system("logrotate -f $opts::ROTATE_CONF");
+  system("/bin/mv", $file, $newfile);
+  warn "Failed to rotate existing logfile: $file to $newfile" if ($?>>8);
 }
 
 sub max2 { ($_[0] > $_[1] ? $_[0] : $_[1] ) }
@@ -125,6 +195,10 @@ sub calculate_count {
     return int($secondsleft / $interval) + ($secondsleft % $interval ? 1 : 0);
 }
 
+mkdir($opts::LOG_DIR) 
+    unless -d $opts::LOG_DIR;
+die "Log directory $opts::LOG_DIR is not writable or cannot be created" 
+    unless -w $opts::LOG_DIR;
 my $outfile= $opts::LOG_DIR . "today";
 rotate($outfile) if should_rotate($outfile);
 
@@ -134,9 +208,13 @@ my $pscmd = $opts::PS_EXEC . ' -ww -A --sort ' . $opts::PS_SORT_OPTS .
 	  ' -o pgrp:8,tty:7,' . $opts::PS_OUTPUT_OPTS;
 
 
-$SIG{'HUP'} = \&reboot;
+$SIG{HUP} = \&reboot;
+
+use Fcntl qw(:flock);
+
 open (OUT,">>",$outfile) || die "Cannot open-for-writing or append to '$outfile': $!";
-flock(OUT,2);
+flock(OUT,LOCK_EX|LOCK_NB) || do { warn "An instance of $0 is already running" if $::debug; exit; };
+warn "$0 starting up, writing to $outfile";
 select(OUT);
 $|=1;
 while ( $count-- > 0 ) {
@@ -144,7 +222,8 @@ while ( $count-- > 0 ) {
   print OUT "\n=== " . localtime() . " === (" . time . ") ===\n" . $snapshot . "\l";
 }
 continue {
-  sleep $opts::INTERVAL if $count;
+  # TODO: fix if duration of ps is longer than INTERVAL
+  sleep $opts::INTERVAL; #  if $count; always sleep; edge case is 23:59:31
 }
 
 close OUT;
