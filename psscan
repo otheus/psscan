@@ -51,13 +51,13 @@ sub init {
     pick($c,'SHOW_KTHREADS','K',0);
     pick($c,'SHOW_INTERACTIVE','I',0);
     pick($c,'INTERVAL','i',60);
-    die "Interval is too short. Set to 10 (s) or greater" 
+    die "[FATAL] Interval is too short. Set to 10 (s) or greater" 
 	unless $INTERVAL >= 10;
     pick($c,'PS_EXEC','E',"/bin/ps");
-    die "PS_EXEC does not point to a valid executable" unless -x $PS_EXEC;
+    die "[FATAL] PS_EXEC does not point to a valid executable" unless -x $PS_EXEC;
     pick($c,'PS_OUTPUT_OPTS','o',
-	qw( pid,lwp,ppid,sid,c,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,nlwp,lstart,args ));
-    die "To filter out KThreads, PS_OUTPUT_OPTS must include one of args/cmd/comm and one of rss/sz/vss/vsz/size"
+	qw( pid,ppid,sgi_p:2=P,stat:5,c:2,cp:4,pmem:5,rss:8,sz:8,size:8=TSIZE,vsz:8,wchan:10,lstart,args ));
+    die "[FATAL] To filter out KThreads, PS_OUTPUT_OPTS must include one of args/cmd/comm and one of rss/sz/vss/vsz/size"
 	if $SHOW_KTHREADS == 0 && 
 	   $PS_OUTPUT_OPTS !~ /\b(args|comm|cmd)\b/i &&
 	   $PS_OUTPUT_OPTS !~ /\b(rss|vss|sz|size)\b/i ;
@@ -113,7 +113,7 @@ sub snapshot {
     my $pscmd = shift;
     my $truncate_prefix= ($opts::SHOW_INTERACTIVE ? 9 : 17);
 
-    open(PS,"-|",$pscmd) || die "Cannot run ps command : $!";
+    open(PS,"-|",$pscmd) || die "[ERROR] Cannot run ps command : $!";
     $_ = <PS>;
     if (! defined $header) {
       $header = $_;
@@ -135,27 +135,20 @@ sub snapshot {
 
 ### Main
 package main;
-use POSIX qw(:signal_h sigprocmask);
+use POSIX;
+
 my @ARGV_ORIG = @ARGV;
-# warn "$0 starting up";
-&opts::init;
+warn "[DEBUG] $0 starting up" if $ENV{PSSCAN_DEBUG};
 
+# Signal handler for restart-on-HUP
 sub reboot {
-  # From http://docstore.mik.ua/orelly/perl4/cook/ch17_19.htm
-  warn "HUP received: Restarting $0";
+    warn "[INFO] HUP received: Restarting $0";
 
-  # Cancel the sleep
-  alarm(0);
+    # Cancel the sleep (just in case)
+    alarm(0);
 
-  # make signals harmless
-  for my $nal (qw[ALARM CHLD HUP INT PIPE TERM]) { $SIG{$nal} = sub {}; }
-
-  # reenable them
-  my $s = POSIX::SigSet->new;
-  my $t = POSIX::SigSet->new;
-  sigprocmask(SIG_UNBLOCK, $s, $t);
-
-  exec( $^X, $0, @ARGV_ORIG ) or die "Can't re-exec myself($^X,$0): $!\n";
+    # Restart
+    exec( $^X, $0, @ARGV_ORIG ) or die "[FATAL] Can't re-exec myself($^X,$0): $!\n";
 }
 
 # Return true if last mtime on arg1 is older than one day
@@ -167,15 +160,15 @@ sub should_rotate {
 ### Poor man's rotate
 ###  move "/var/log/ps/today" to "/var/log/ps/20160201"
 sub rotate {
-  use POSIX;
-  my $file = shift;
-  my $ft = (stat($file))[9];
-  my $yyyymmdd = POSIX::strftime("%Y%m%d",localtime($ft));
-  my $newfile = $file;
-  $newfile =~ s/\btoday$/$yyyymmdd/;
-  # system("logrotate -f $opts::ROTATE_CONF");
-  system("/bin/mv", $file, $newfile);
-  warn "Failed to rotate existing logfile: $file to $newfile" if ($?>>8);
+    use POSIX;
+    my $file = shift;
+    my $ft = (stat($file))[9];
+    my $yyyymmdd = POSIX::strftime("%Y%m%d",localtime($ft));
+    my $newfile = $file;
+    $newfile =~ s/\btoday$/$yyyymmdd/;
+    # system("logrotate -f $opts::ROTATE_CONF");
+    system("/bin/mv", $file, $newfile);
+    warn "[ERROR] Failed to rotate existing logfile: $file to $newfile" if ($?>>8);
 }
 
 sub max2 { ($_[0] > $_[1] ? $_[0] : $_[1] ) }
@@ -195,38 +188,59 @@ sub calculate_count {
     return int($secondsleft / $interval) + ($secondsleft % $interval ? 1 : 0);
 }
 
-mkdir($opts::LOG_DIR) 
-    unless -d $opts::LOG_DIR;
-die "Log directory $opts::LOG_DIR is not writable or cannot be created" 
-    unless -w $opts::LOG_DIR;
-my $outfile= $opts::LOG_DIR . "today";
-rotate($outfile) if should_rotate($outfile);
+my $outfile;
 
-my $count = calculate_count($opts::INTERVAL,time);
-my $pgrp = getpgrp;
-my $pscmd = $opts::PS_EXEC . ' -ww -A --sort ' . $opts::PS_SORT_OPTS .  
-	  ' -o pgrp:8,tty:7,' . $opts::PS_OUTPUT_OPTS;
+# Process arguments, options, etc
+&opts::init;
 
-
-$SIG{HUP} = \&reboot;
-
-use Fcntl qw(:flock);
-
-open (OUT,">>",$outfile) || die "Cannot open-for-writing or append to '$outfile': $!";
-flock(OUT,LOCK_EX|LOCK_NB) || do { warn "An instance of $0 is already running" if $::debug; exit; };
-warn "$0 starting up, writing to $outfile";
-select(OUT);
-$|=1;
-while ( $count-- > 0 ) {
-  my $snapshot = &psscan::snapshot($pgrp,$pscmd);
-  print OUT "\n=== " . localtime() . " === (" . time . ") ===\n" . $snapshot . "\l";
-}
-continue {
-  # TODO: fix if duration of ps is longer than INTERVAL
-  sleep $opts::INTERVAL; #  if $count; always sleep; edge case is 23:59:31
+# Setup output file, directory, autorotate
+{ 
+    mkdir($opts::LOG_DIR) 
+	unless -d $opts::LOG_DIR;
+    die "[FATAL] Log directory $opts::LOG_DIR is not writable or cannot be created" 
+	unless -w $opts::LOG_DIR;
+    $outfile= $opts::LOG_DIR . "today";
+    rotate($outfile) if should_rotate($outfile);
 }
 
-close OUT;
+
+# Setup HUP handler
+{ 
+    # From http://www.nntp.perl.org/group/perl.perl5.porters/2002/05/msg58319.html
+    # this doesn't work right: $SIG{HUP} = \&reboot;
+    my $sigset = POSIX::SigSet->new();
+    my $action = POSIX::SigAction->new(
+      \&reboot, $sigset, &POSIX::SA_NODEFER);
+    POSIX::sigaction(&POSIX::SIGHUP, $action);
+}
+
+# Main loop, etc
+{ 
+    use Fcntl qw(:flock);
+    my $count = calculate_count($opts::INTERVAL,time);
+    my $pgrp = getpgrp;
+    my $pscmd = $opts::PS_EXEC . ' -ww -A --sort ' . $opts::PS_SORT_OPTS .  
+	      ' -o pgrp:8,tty:7,' . $opts::PS_OUTPUT_OPTS;
+
+    open (OUT,">>",$outfile) or
+	die "[FATAL] Cannot open-for-writing or append to '$outfile': $!";
+    flock(OUT,LOCK_EX|LOCK_NB) or do { 
+	warn "[INFO] An instance of $0 is already running" if $ENV{PSSCAN_DEBUG};
+	exit; 
+    };
+    warn "[INFO] $0 initialized, writing to $outfile";
+
+    select(OUT); $|=1;
+    while ( $count-- > 0 ) {
+	my $snapshot = &psscan::snapshot($pgrp,$pscmd);
+	print OUT "\n=== " . localtime() . " === (" . time . ") ===\n" . $snapshot . "\l";
+    }
+    continue {
+	# TODO: fix if duration of ps is longer than INTERVAL
+	sleep $opts::INTERVAL; #  if $count; always sleep; edge case is 23:59:31
+    }
+    close OUT;
+}
 
 &reboot;
 

@@ -1,0 +1,4 @@
+*/10 * * * * root /usr/sbin/psscan 2>&1 | logger -p user.warning
+#
+52 23 * * * root nice find /var/log/sa/ps \! -name "*.xz" -size +0 -mtime +5 -exec xz {} +
+51 23 * * * root find /var/log/sa/ps -mtime +60 -exec /bin/rm -f {} +
