@@ -3,7 +3,7 @@ Continuously logs state of all interesting processes to a file
 
 ## Usage : `psscan [options] | logger -p user.info `
 
-From `/etc/inittab` or `crond`, launch this program. It will continuously take a snapshot of the process table at the user-defined interval. 
+From `/etc/inittab` or `crond`, launch this program. It will continuously take a snapshot of the process table at the user-defined interval. Each snapshot is timestamped in both human-readable form and seconds-since-epoch. Output fields can be customized. An attempt to intelligently filter out useless information is made.
 
 ## Options
 
