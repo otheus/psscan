@@ -143,8 +143,9 @@ my @ARGV_ORIG = @ARGV;
 if (exists $ENV{PSSCAN_DEBUG} || defined $DB::VERSION) {
     warn "[DEBUG] $0 starting up";
 } else {
-    open(STDERR,"|logger -t psscan -p user.info --");
     close(STDOUT);
+    *oldstderr = select STDERR;
+    open(STDERR,"|logger -t psscan -p user.notice --");
 }
 
 
@@ -152,6 +153,9 @@ if (exists $ENV{PSSCAN_DEBUG} || defined $DB::VERSION) {
 # Signal handler for restart-on-HUP
 sub reboot {
     warn "[INFO] HUP received: Restarting $0";
+
+    close(STDERR);
+    open(STDERR,">&oldstderr");
 
     # Cancel the sleep (just in case)
     alarm(0);
@@ -184,12 +188,11 @@ sub max2 { ($_[0] > $_[1] ? $_[0] : $_[1] ) }
 sub min2 { ($_[0] > $_[1] ? $_[1] : $_[0] ) }
 
 sub calculate_count { 
-    use Date::Calc;
     use Time::Local 'timelocal_nocheck';
     my $interval = max2(shift,1);
     my $time = shift;
     my ($now,@now)=($time,localtime($time));
-    my $midnight=Time::Local::timelocal(0,0,0,reverse Date::Calc::Add_Delta_Days(@now[5,4,3],1));
+    my $midnight=Time::Local::timelocal(59,59,23,@now[3,4,5])+1;
     my $secondsleft = $midnight-$now-1;
     # Return the number of intervals we can perform until midnight. 
     # If $secondsleft <= $interval, we should perfom exactly 1. 

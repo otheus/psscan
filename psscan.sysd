@@ -1,0 +1,10 @@
+[Unit]
+Description=PS monitoring tool
+After=syslog.target 
+
+[Service]
+#EnvironmentFile=/etc/sysconfig/atd
+ExecStart=/usr/sbin/psscan
+
+[Install]
+WantedBy=multi-user.target
