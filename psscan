@@ -145,7 +145,7 @@ if (exists $ENV{PSSCAN_DEBUG} || defined $DB::VERSION) {
 } else {
     close(STDOUT);
     *oldstderr = select STDERR;
-    open(STDERR,"|logger -t psscan -p user.info --");
+    open(STDERR,"|logger -t psscan -p user.notice --");
 }
 
 
