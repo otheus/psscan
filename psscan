@@ -4,13 +4,14 @@
 # Scan process table and note differences since previous run.
 # Start a new set of differences every day
 #
-# Version: 2.0
+# Version: 2.1
 # Build Date: 2016-02-05
 # 
 # 2009-03-29 *otheus*
 # 2009-07-01  minor changes for blog
 # 2013-10-24  converted to perl and dropped diffing
 # 2016-02-05  overhaul: runs more like a daemon than cronjob
+# 2016-02-10  send error to logger as child process; logrotate done via filenames
 
 use strict;
 
@@ -138,7 +139,15 @@ package main;
 use POSIX;
 
 my @ARGV_ORIG = @ARGV;
-warn "[DEBUG] $0 starting up" if $ENV{PSSCAN_DEBUG};
+# Redirect output via logger, unless we're in debug-mode
+if (exists $ENV{PSSCAN_DEBUG} || defined $DB::VERSION) {
+    warn "[DEBUG] $0 starting up";
+} else {
+    open(STDERR,"|logger -t psscan -p user.info --");
+    close(STDOUT);
+}
+
+
 
 # Signal handler for restart-on-HUP
 sub reboot {
@@ -151,24 +160,24 @@ sub reboot {
     exec( $^X, $0, @ARGV_ORIG ) or die "[FATAL] Can't re-exec myself($^X,$0): $!\n";
 }
 
+# should_rotate:
+#
+# Return true if file does NOT exist
 # Return true if last mtime on arg1 is older than one day
 sub should_rotate {
     my ($file) = @_;
-    return (-f $file && -s _ && (stat(_))[9] < time - (24*60*60) );
+    return 1 if -f !$file;
+    return (-s _ && (stat(_))[9] < time - (24*60*60) );
 }
 
 ### Poor man's rotate
-###  move "/var/log/ps/today" to "/var/log/ps/20160201"
-sub rotate {
-    use POSIX;
+sub rotate { 1 }
+
+sub post_rotate {
     my $file = shift;
-    my $ft = (stat($file))[9];
-    my $yyyymmdd = POSIX::strftime("%Y%m%d",localtime($ft));
-    my $newfile = $file;
-    $newfile =~ s/\btoday$/$yyyymmdd/;
-    # system("logrotate -f $opts::ROTATE_CONF");
-    system("/bin/mv", $file, $newfile);
-    warn "[ERROR] Failed to rotate existing logfile: $file to $newfile" if ($?>>8);
+    my $newfile = $opts::LOG_DIR . "today";
+    system("/bin/ln","-sf", $file, $newfile);
+    warn "[ERROR] Failed to link to existing logfile: $file to $newfile" if ($?>>8);
 }
 
 sub max2 { ($_[0] > $_[1] ? $_[0] : $_[1] ) }
@@ -199,8 +208,9 @@ my $outfile;
 	unless -d $opts::LOG_DIR;
     die "[FATAL] Log directory $opts::LOG_DIR is not writable or cannot be created" 
 	unless -w $opts::LOG_DIR;
-    $outfile= $opts::LOG_DIR . "today";
+    $outfile= $opts::LOG_DIR . POSIX::strftime("%Y%m%d",localtime());
     rotate($outfile) if should_rotate($outfile);
+    post_rotate($outfile);
 }
 
 
