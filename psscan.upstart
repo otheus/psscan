@@ -7,4 +7,4 @@ start on runlevel [345]
 stop on runlevel [016]
 
 respawn
-exec /usr/bin/psscan 
+exec /usr/sbin/psscan 
